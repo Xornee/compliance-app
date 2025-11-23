@@ -543,7 +543,8 @@ function renderMarkdown(controls, overallStatus, timestamp) {
 }
 
 function escapeMarkdown(text) {
-  return String(text).replace(/\|/g, '\\|');
+  // First escape backslashes, then pipes
+  return String(text).replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
 }
 
 main().catch((err) => {
