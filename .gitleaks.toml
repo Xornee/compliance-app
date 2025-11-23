@@ -1,0 +1,24 @@
+title = "compliance-app gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Global allowlist for non-secret files and one intentional example false-positive."
+paths = [
+  '''\.gitleaks\.toml$''',
+  '''README\.md$''',
+  '''(.*?)(jpg|jpeg|png|gif|ico|svg|pdf|zip|tar|gz)$''',
+  '''example-fake-secret\.md$'''
+]
+
+[[rules]]
+id = "generic-credential-assignment"
+description = "Generic credentials: password/token/api_key assignment with high-entropy value"
+regex = '''(?i)(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*["']([A-Za-z0-9_\-\/+=]{16,})["']'''
+tags = ["secret", "generic", "high-entropy"]
+
+  [[rules.Entropies]]
+  Min = 3.5
+  Max = 8.0
+  Group = 2 

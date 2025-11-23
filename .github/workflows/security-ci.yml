@@ -1,0 +1,629 @@
+name: Security & Compliance Pipeline
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+concurrency:
+  group: security-compliance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: compliance-app:${{ github.sha }}
+  ARTIFACT_DIR: artifacts
+  GITLEAKS_VERSION: "8.24.3"
+  TRIVY_FAIL_SEVERITY: CRITICAL
+  DOCKLE_FAILURE_THRESHOLD: warn
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  gitleaks:
+    name: Secrets scan (Gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Create artifacts directory
+        run: mkdir -p "$ARTIFACT_DIR"
+
+      - name: Gitleaks Action (PR comments, summary)
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_SUMMARY: "true"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+      - name: Install Gitleaks CLI
+        run: |
+          set -e
+          curl -sL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run Gitleaks CLI (JSON report, non-blocking)
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          gitleaks detect \
+            --source . \
+            --report-format json \
+            --report-path "$ARTIFACT_DIR/gitleaks.json" \
+            --config .gitleaks.toml \
+            2>&1 | tee "$ARTIFACT_DIR/gitleaks.log" || true
+
+      - name: Run Gitleaks CLI (SARIF report, non-blocking)
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          gitleaks detect \
+            --source . \
+            --report-format sarif \
+            --report-path "$ARTIFACT_DIR/gitleaks.sarif" \
+            --config .gitleaks.toml || true
+
+      - name: Gitleaks summary (Job Summary)
+        if: always()
+        run: |
+          echo "## Gitleaks Secrets Scan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f "$ARTIFACT_DIR/gitleaks.json" ]; then
+            leaks=$(jq 'length' "$ARTIFACT_DIR/gitleaks.json")
+            status="✅ PASS"
+            [ "$leaks" -gt 0 ] && status="❌ FAIL"
+
+            echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ------ | ----- |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Status | ${status} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Total leaks | ${leaks} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+
+            if [ -f "$ARTIFACT_DIR/gitleaks.log" ]; then
+              echo "<details><summary>Raw Gitleaks output</summary>" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo '```text' >> "$GITHUB_STEP_SUMMARY"
+              cat "$ARTIFACT_DIR/gitleaks.log" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "_gitleaks.json not found; check previous steps._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Gitleaks SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        continue-on-error: true
+        with:
+          sarif_file: ${{ env.ARTIFACT_DIR }}/gitleaks.sarif
+          category: gitleaks
+
+      - name: Gitleaks gate (fail on leaks)
+        run: |
+          set -e
+
+          if [ ! -f "$ARTIFACT_DIR/gitleaks.json" ]; then
+            echo "gitleaks.json not found; failing secrets gate."
+            exit 1
+          fi
+
+          leaks=$(jq 'length' "$ARTIFACT_DIR/gitleaks.json")
+          echo "Total leaks detected: $leaks"
+
+          if [ "$leaks" -gt 0 ]; then
+            echo "ERROR: Secrets detected by Gitleaks. Failing job."
+            exit 1
+          fi
+
+      - name: Upload Gitleaks artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts-gitleaks
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 7
+
+  fs-scan:
+    name: Filesystem scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: gitleaks
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create artifacts directory
+        run: mkdir -p "$ARTIFACT_DIR"
+
+      - name: Trivy filesystem summary (table, non-blocking)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: LOW,MEDIUM,HIGH,CRITICAL
+          format: table
+          output: ${{ env.ARTIFACT_DIR }}/trivy-fs-table.txt
+          exit-code: 0
+
+      - name: Trivy filesystem summary (Job Summary)
+        if: always()
+        run: |
+          echo "## Trivy Filesystem Scan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f "$ARTIFACT_DIR/trivy-fs-table.txt" ]; then
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat "$ARTIFACT_DIR/trivy-fs-table.txt" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_Trivy filesystem table output not found._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Trivy filesystem scan (JSON report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          format: json
+          output: ${{ env.ARTIFACT_DIR }}/trivy-fs.json
+          exit-code: 0
+
+      - name: Trivy filesystem scan (SARIF report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          format: sarif
+          output: ${{ env.ARTIFACT_DIR }}/trivy-fs.sarif
+          exit-code: 0
+
+      - name: Upload filesystem SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        continue-on-error: true
+        with:
+          sarif_file: ${{ env.ARTIFACT_DIR }}/trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Trivy filesystem gate (fail on CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: ${{ env.TRIVY_FAIL_SEVERITY }}
+          format: table
+          limit-severities-for-sarif: true
+          exit-code: 1
+
+      - name: Upload filesystem security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts-fs
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 7
+
+  image-build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: fs-scan
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build --pull -t "$IMAGE_NAME" .
+
+      - name: Save Docker image as artifact
+        run: |
+          mkdir -p docker-image
+          docker save "$IMAGE_NAME" -o docker-image/docker-image.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: docker-image
+          retention-days: 1
+
+  image-scan:
+    name: Docker image scan
+    runs-on: ubuntu-latest
+    needs: image-build
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create artifacts directory
+        run: mkdir -p "$ARTIFACT_DIR"
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: docker-image
+
+      - name: Load Docker image
+        run: docker load -i docker-image/docker-image.tar
+
+      - name: Trivy image summary (table, non-blocking)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}
+          vuln-type: os,library
+          severity: LOW,MEDIUM,HIGH,CRITICAL
+          format: table
+          output: ${{ env.ARTIFACT_DIR }}/trivy-image-table.txt
+          exit-code: 0
+
+      - name: Trivy image scan summary (Job Summary)
+        if: always()
+        run: |
+          echo "## Trivy Image Scan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f "$ARTIFACT_DIR/trivy-image-table.txt" ]; then
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat "$ARTIFACT_DIR/trivy-image-table.txt" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_Trivy image table output not found._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Trivy image scan (JSON report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}
+          vuln-type: os,library
+          format: json
+          output: ${{ env.ARTIFACT_DIR }}/trivy-image.json
+          exit-code: 0
+
+      - name: Trivy image scan (SARIF report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}
+          vuln-type: os,library
+          format: sarif
+          output: ${{ env.ARTIFACT_DIR }}/trivy-image.sarif
+          exit-code: 0
+
+      - name: Upload image SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        continue-on-error: true
+        with:
+          sarif_file: ${{ env.ARTIFACT_DIR }}/trivy-image.sarif
+          category: trivy-image
+
+      - name: Enforce required image labels
+        run: |
+          owner=$(docker inspect -f '{{ index .Config.Labels "owner" }}' "$IMAGE_NAME" || echo "")
+          version=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$IMAGE_NAME" || echo "")
+
+          echo "Detected labels on $IMAGE_NAME:"
+          echo "  owner:   '${owner}'"
+          echo "  version: '${version}'"
+
+          if [ -z "$owner" ] || [ -z "$version" ]; then
+            echo "ERROR: required image labels are missing."
+            echo "Image must have both 'owner' and 'org.opencontainers.image.version' labels."
+            exit 1
+          fi
+
+      - name: Trivy image gate (fail on CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}
+          vuln-type: os,library
+          scanners: vuln
+          severity: ${{ env.TRIVY_FAIL_SEVERITY }}
+          format: table
+          limit-severities-for-sarif: true
+          exit-code: 1
+
+      - name: Upload image security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts-image
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 7
+
+  sbom:
+    name: Generate SBOM (Syft)
+    runs-on: ubuntu-latest
+    needs: image-build
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create artifacts directory
+        run: mkdir -p "$ARTIFACT_DIR"
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: docker-image
+
+      - name: Load Docker image
+        run: docker load -i docker-image/docker-image.tar
+
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}
+          output-file: ${{ env.ARTIFACT_DIR }}/sbom.json
+          format: cyclonedx-json
+          upload-artifact: false
+
+      - name: Upload SBOM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts-sbom
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 7
+
+  dockle:
+    name: Docker hardening (Dockle)
+    runs-on: ubuntu-latest
+    needs: image-build
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create artifacts directory
+        run: mkdir -p "$ARTIFACT_DIR"
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: docker-image
+
+      - name: Load Docker image
+        run: docker load -i docker-image/docker-image.tar
+
+      - name: Dockle container hardening
+        uses: erzz/dockle-action@v1.4.0
+        with:
+          image: ${{ env.IMAGE_NAME }}
+          report-format: json
+          report-name: dockle
+          failure-threshold: ${{ env.DOCKLE_FAILURE_THRESHOLD }}
+          exit-code: 1
+
+      - name: Move Dockle report into artifacts
+        if: always()
+        run: |
+          if [ -f dockle.json ]; then
+            mv dockle.json "$ARTIFACT_DIR/dockle.json"
+          elif [ -f dockle-report.json ]; then
+            mv dockle-report.json "$ARTIFACT_DIR/dockle.json"
+          else
+            echo "Dockle report file not found; skipping move."
+          fi
+
+      - name: Dockle summary (Job Summary)
+        if: always()
+        run: |
+          REPORT_JSON="$ARTIFACT_DIR/dockle.json"
+
+          if [ ! -f "$REPORT_JSON" ]; then
+            echo "## Dockle Image Scan Summary" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_Dockle report not found._" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo ""
+            echo "## Dockle Image Scan Summary"
+            echo ""
+
+            jq -r '
+              .summary as $s
+              | "Totals: FATAL=\($s.fatal)  WARN=\($s.warn)  INFO=\($s.info)  PASS=\($s.pass)"
+            ' "$REPORT_JSON"
+
+            echo ""
+            echo "### Findings"
+            echo ""
+            echo "| Level | Code | Title | First alert |"
+            echo "| ----- | ---- | ----- | ----------- |"
+
+            jq -r '
+              def esc(s):
+                (s // "") | gsub("\\|"; "\\|");
+              .details[]
+              | "| \(.level) | \(.code) | \(esc(.title)) | \(esc(.alerts[0])) |"
+            ' "$REPORT_JSON"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Dockle security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts-dockle
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 7
+
+  compliance-report:
+    if: ${{ always() }}
+    name: Compliance report & security dashboard
+    runs-on: ubuntu-latest
+    needs:
+      - gitleaks
+      - fs-scan
+      - image-scan
+      - sbom
+      - dockle
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create artifacts directory
+        run: mkdir -p "$ARTIFACT_DIR"
+
+      - name: Download security artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-artifacts
+
+      - name: Merge artifacts into $ARTIFACT_DIR
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          for f in $(find downloaded-artifacts -maxdepth 3 -type f); do
+            base=$(basename "$f")
+            cp "$f" "$ARTIFACT_DIR/$base"
+          done
+          echo "Final artifact directory contents:"
+          ls -R "$ARTIFACT_DIR" || true
+
+      - name: Security dashboard (Job Summary)
+        if: always()
+        run: |
+          echo "## Security Dashboard" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Status | Details |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ----- | ------ | ------- |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f "$ARTIFACT_DIR/gitleaks.json" ]; then
+            leaks=$(jq 'length' "$ARTIFACT_DIR/gitleaks.json")
+            status="✅ PASS"
+            details="${leaks} leaks"
+            if [ "$leaks" -gt 0 ]; then
+              status="❌ FAIL"
+            fi
+            echo "| Secrets (Gitleaks) | ${status} | ${details} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Secrets (Gitleaks) | ⚠️ N/A | gitleaks.json not found |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f "$ARTIFACT_DIR/trivy-fs.json" ]; then
+            fs_crit=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$ARTIFACT_DIR/trivy-fs.json")
+            fs_high=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$ARTIFACT_DIR/trivy-fs.json")
+            status="✅ PASS"
+            details="CRITICAL=${fs_crit}, HIGH=${fs_high}"
+            if [ "$fs_crit" -gt 0 ]; then
+              status="❌ FAIL"
+            fi
+            echo "| Filesystem vulns (Trivy) | ${status} | ${details} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Filesystem vulns (Trivy) | ⚠️ N/A | trivy-fs.json not found |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f "$ARTIFACT_DIR/trivy-image.json" ]; then
+            img_crit=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$ARTIFACT_DIR/trivy-image.json")
+            img_high=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$ARTIFACT_DIR/trivy-image.json")
+            status="✅ PASS"
+            details="CRITICAL=${img_crit}, HIGH=${img_high}"
+            if [ "$img_crit" -gt 0 ]; then
+              status="❌ FAIL"
+            fi
+            echo "| Image vulns (Trivy) | ${status} | ${details} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Image vulns (Trivy) | ⚠️ N/A | trivy-image.json not found |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f "$ARTIFACT_DIR/dockle.json" ]; then
+            fatal=$(jq '.summary.fatal' "$ARTIFACT_DIR/dockle.json")
+            warn=$(jq '.summary.warn' "$ARTIFACT_DIR/dockle.json")
+            status="✅ PASS"
+            details="FATAL=${fatal}, WARN=${warn}"
+            if [ "$fatal" -gt 0 ]; then
+              status="❌ FAIL"
+            fi
+            echo "| Image hardening (Dockle) | ${status} | ${details} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Image hardening (Dockle) | ⚠️ N/A | dockle.json not found |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Generate compliance report
+        run: |
+          set -e
+
+          if [ ! -f scripts/generate-report.js ]; then
+            echo "ERROR: scripts/generate-report.js not found."
+            ls -R
+            exit 1
+          fi
+
+          echo "Using report generator script at: scripts/generate-report.js"
+
+          node scripts/generate-report.js
+
+      - name: Append compliance report to job summary
+        if: always()
+        run: |
+          if [ -f "$ARTIFACT_DIR/compliance-report.md" ]; then
+            {
+              echo ""
+              echo "## Compliance Report"
+              echo ""
+              cat "$ARTIFACT_DIR/compliance-report.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Compliance report not found; see previous steps." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload compliance report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-report
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 30
