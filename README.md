@@ -409,7 +409,6 @@ The **`sbom` job fails** if Syft cannot generate `sbom.json`.
 ### 8.2 Failure conditions
 
 The **`dockle` job fails** when Dockle returns a level ≥ `failure-threshold` (`warn`).  
-In this repository, the **builder stage intentionally omits `apt-get clean`**, which Dockle flags (e.g. CIS-DI-0011), ensuring the hardening gate is exercised.
 
 ---
 
@@ -646,9 +645,6 @@ The Dockerfile implements a **three-stage build** for a NestJS app:
 FROM node:22-slim AS builder
 WORKDIR /app
 
-# Intentionally missing apt-get clean to trigger Dockle CIS-DI-0011
-RUN apt-get update && apt-get install -y curl
-
 COPY package*.json ./
 RUN npm ci
 
@@ -685,16 +681,6 @@ CMD ["dist/main.js"]
 - Responsibilities:
   - Install build tooling (`curl`) and dependencies (`npm ci`).
   - Compile the NestJS app (`npm run build`) into `dist/`.
-- **Intentional Dockle violation:**
-
-  ```Dockerfile
-  # Intentionally missing apt-get clean to trigger Dockle CIS-DI-0011
-  RUN apt-get update && apt-get install -y curl
-  ```
-
-  - This leaves APT cache data in the layer.
-  - Dockle flags it as a CIS hardening issue.
-  - Serves as a practical example of how Dockle findings are surfaced and enforced.
 
 ### 11.2 `deps` stage
 
